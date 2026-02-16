@@ -21,7 +21,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include "twr_ping.h"
+#include "twr_pong.h"
 #include <string.h>
 #include <stdio.h>
 /* USER CODE END Includes */
@@ -100,7 +100,7 @@ int main(void)
   uart2_print("\nThis is the first line \n");
   char buf[64];
   // startup banner
-  snprintf(buf, sizeof(buf), "\r\nG431_DWM_Initiator starting...\r\n");
+  snprintf(buf, sizeof(buf), "\r\nG431_DWM_Responder starting...\r\n");
   HAL_UART_Transmit(&huart2, (uint8_t*)buf, strlen(buf), HAL_MAX_DELAY);
 
   // init DW3000
@@ -113,20 +113,18 @@ int main(void)
   uint32_t devid = dwm_read_devid();
   snprintf(buf, sizeof(buf), "DW3000 devID = 0x%08lX\r\n", (unsigned long)devid);
   HAL_UART_Transmit(&huart2, (uint8_t*)buf, strlen(buf), HAL_MAX_DELAY);
-  twr_ping_init();
+  twr_pong_init();
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	  /*HAL_Delay(1000);
-	  snprintf(buf, sizeof(buf), "alive...\r\n");
-	  HAL_UART_Transmit(&huart2, (uint8_t*)buf, strlen(buf), HAL_MAX_DELAY);*/
-	  //uart2_print("LOOP\r\n");
-	  twr_ping_step();      // send a PING and wait for reply
-	  HAL_Delay(500);
-	  //HAL_Delay(500);       // 2 Hz pings; adjust as needed
+	  //dbg("before step\r\n");
+	  twr_pong_step();
+	  HAL_Delay(5);
+	  //dbg("after step\r\n");
+	  //HAL_Delay(500);
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
