@@ -21,7 +21,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include "twr_pong.h"
+#include "twr_ping.h"
 #include <string.h>
 #include <stdio.h>
 /* USER CODE END Includes */
@@ -100,7 +100,7 @@ int main(void)
   uart2_print("\nThis is the first line \n");
   char buf[64];
   // startup banner
-  snprintf(buf, sizeof(buf), "\r\nG431_DWM_Responder starting...\r\n");
+  snprintf(buf, sizeof(buf), "\r\nG431_DWM_Initiator starting...\r\n");
   HAL_UART_Transmit(&huart2, (uint8_t*)buf, strlen(buf), HAL_MAX_DELAY);
 
   // init DW3000
@@ -113,17 +113,20 @@ int main(void)
   uint32_t devid = dwm_read_devid();
   snprintf(buf, sizeof(buf), "DW3000 devID = 0x%08lX\r\n", (unsigned long)devid);
   HAL_UART_Transmit(&huart2, (uint8_t*)buf, strlen(buf), HAL_MAX_DELAY);
-  twr_pong_init();
+  twr_ping_init();
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	  //dbg("before step\r\n");
-	  twr_pong_step();
-	  //dbg("after step\r\n");
-	  //HAL_Delay(500);
+	  /*HAL_Delay(1000);
+	  snprintf(buf, sizeof(buf), "alive...\r\n");
+	  HAL_UART_Transmit(&huart2, (uint8_t*)buf, strlen(buf), HAL_MAX_DELAY);*/
+	  //uart2_print("LOOP\r\n");
+	  twr_ping_step();      // send a PING and wait for reply
+	  HAL_Delay(500);
+	  //HAL_Delay(500);       // 2 Hz pings; adjust as needed
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -200,7 +203,7 @@ static void MX_SPI1_Init(void)
   hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
   hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
   hspi1.Init.NSS = SPI_NSS_SOFT;
-  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_16;
+  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_4;
   hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
   hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
   hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;

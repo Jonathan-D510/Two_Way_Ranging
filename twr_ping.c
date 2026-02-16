@@ -1,198 +1,313 @@
-// G431_DWM_Initiator/Core/Src/twr_ping.c
-
 #include "twr_ping.h"
 #include "deca_device_api.h"
-#include "dwm_port.h"
-#include "dwm_init.h"
 #include "main.h"
 
 #include <stdio.h>
 #include <string.h>
+#include <stdint.h>
 
-static uint8_t tx_ping_msg[] = { 'P', 'I', 0x00, 0x0C };
-static uint8_t rx_buf[16];
-static uint8_t ping_seq = 0;
+extern UART_HandleTypeDef huart2;
+
+#define PAN_ID    0xCAFE
+#define ADDR_INIT 0x1234
+#define ADDR_RESP 0x5678
+
+#define FCF0 0x41
+#define FCF1 0x88
+
+#define FCS_LEN     2
+#define RX_FCS_LEN  2
+
+// Calibrated to center your ~40 cm cluster:
+// RAW ~37.42 m at true ~0.40 m -> OFFSET ~37.02 m
+#define OFFSET_MM   37020u
+
+// Reject sudden jumps bigger than this (mm)
+#define JUMP_REJECT_MM  300u   // 0.30 m
+
+static void p(const char *s)
+{
+    HAL_UART_Transmit(&huart2, (uint8_t*)s, (uint16_t)strlen(s), HAL_MAX_DELAY);
+}
+
+static void p_hexN(const char *tag, const uint8_t *b, uint16_t len, uint16_t nmax)
+{
+    char buf[512];
+    uint16_t n = (len > nmax) ? nmax : len;
+    int off = snprintf(buf, sizeof(buf), "%s len=%u:", tag, (unsigned)len);
+    for (uint16_t i = 0; i < n && off < (int)sizeof(buf) - 4; i++)
+        off += snprintf(buf + off, sizeof(buf) - off, " %02X", b[i]);
+    off += snprintf(buf + off, sizeof(buf) - off, "\r\n");
+    p(buf);
+}
+
+static void i64_to_dec(char *out, size_t out_sz, int64_t v)
+{
+    if (out_sz == 0) return;
+
+    char tmp[32];
+    int neg = 0;
+    uint64_t x;
+
+    if (v < 0) { neg = 1; x = (uint64_t)(-v); }
+    else       { x = (uint64_t)v; }
+
+    int i = 0;
+    do {
+        tmp[i++] = (char)('0' + (x % 10));
+        x /= 10;
+    } while (x && i < (int)sizeof(tmp));
+
+    size_t pos = 0;
+    if (neg && pos + 1 < out_sz) out[pos++] = '-';
+
+    while (i-- > 0 && pos + 1 < out_sz) out[pos++] = tmp[i];
+    out[pos] = 0;
+}
+
+static uint64_t ts40_from5(const uint8_t ts[5])
+{
+    uint64_t v = 0;
+    for (int i = 0; i < 5; i++) v |= ((uint64_t)ts[i]) << (8*i);
+    return v;
+}
+
+static uint64_t read_tx_ts40(void)
+{
+    uint8_t ts[5] = {0};
+    dwt_readtxtimestamp(ts);
+    return ts40_from5(ts);
+}
+
+static uint64_t read_rx_ts40(void)
+{
+    uint8_t ts[5] = {0};
+    dwt_readrxtimestamp(ts, (dwt_ip_sts_segment_e)0);
+    return ts40_from5(ts);
+}
+
+static uint64_t read_ts40_from_msg(const uint8_t *buf, int idx)
+{
+    uint64_t v = 0;
+    for (int i = 0; i < 5; i++) v |= ((uint64_t)buf[idx + i]) << (8*i);
+    return v;
+}
+
+#ifndef DWT_TIME_UNITS
+#define DWT_TIME_UNITS (1.0/499.2e6/128.0)
+#endif
+
+static uint32_t tof_ticks_to_mm(int64_t tof_dtu)
+{
+    const double C = 299702547.0;
+    double meters = ((double)tof_dtu) * DWT_TIME_UNITS * C;
+    if (meters < 0) meters = 0;
+    double mm = meters * 1000.0;
+    if (mm < 0) mm = 0;
+    if (mm > 4.0e9) mm = 4.0e9;
+    return (uint32_t)(mm + 0.5);
+}
+
+static void format_dist(char *out, size_t out_sz, uint32_t mm)
+{
+    uint32_t m_int  = mm / 1000;
+    uint32_t m_frac = mm % 1000;
+
+    uint32_t cm10     = mm;
+    uint32_t cm_int   = cm10 / 10;
+    uint32_t cm_frac1 = cm10 % 10;
+
+    uint32_t inches10 = (uint32_t)(((uint64_t)mm * 1000ULL + 127ULL) / 254ULL);
+    uint32_t total_inches = inches10 / 10;
+    uint32_t inch_frac1   = inches10 % 10;
+
+    uint32_t feet       = total_inches / 12;
+    uint32_t inch_whole = total_inches % 12;
+
+    snprintf(out, out_sz,
+             "%lu.%03lu m = %lu.%01lu cm = %lu ft %lu.%01lu in",
+             (unsigned long)m_int, (unsigned long)m_frac,
+             (unsigned long)cm_int, (unsigned long)cm_frac1,
+             (unsigned long)feet, (unsigned long)inch_whole, (unsigned long)inch_frac1);
+}
+
+/*
+ * PING frame: header(9) + app(3) = 12 bytes
+ * App: 'P','I',seq
+ */
+static uint8_t tx_ping[12] = {
+    FCF0, FCF1, 0,
+    (uint8_t)(PAN_ID & 0xFF), (uint8_t)(PAN_ID >> 8),
+    (uint8_t)(ADDR_RESP & 0xFF), (uint8_t)(ADDR_RESP >> 8),
+    (uint8_t)(ADDR_INIT & 0xFF), (uint8_t)(ADDR_INIT >> 8),
+    'P','I', 0
+};
+
+static int find_pong(const uint8_t *buf, uint16_t len, uint8_t want_seq, int *idx_out)
+{
+    if (len <= RX_FCS_LEN) return 0;
+    uint16_t usable = (uint16_t)(len - RX_FCS_LEN);
+    if (usable < 13) return 0;
+
+    for (uint16_t i = 0; i + 12 < usable; i++) {
+        if (buf[i] == 'P' && buf[i+1] == 'O' && buf[i+2] == want_seq) {
+            *idx_out = (int)i;
+            return 1;
+        }
+    }
+    return 0;
+}
 
 void twr_ping_init(void)
 {
-    dbg("twr_ping_init: ready\r\n");
-    ping_seq = 0;
+    p("twr_ping_init ready\r\n");
+    {
+        char b[120];
+        snprintf(b, sizeof(b), "PING: OFFSET_MM=%lu JUMP_REJECT_MM=%lu\r\n",
+                 (unsigned long)OFFSET_MM, (unsigned long)JUMP_REJECT_MM);
+        p(b);
+    }
 }
 
 void twr_ping_step(void)
 {
-    int32_t ret;
-    uint32_t status = 0;
-    char buf[128];
+    static uint8_t app_seq = 0;
+    static uint8_t mac_seq = 0;
 
-    dbg("twr_ping: step start\r\n");
+    // last accepted corrected measurement (mm)
+    static uint32_t last_corr_mm = 0;
+    static uint8_t  have_last = 0;
 
-    /* Prepare PING frame */
-    tx_ping_msg[2] = ping_seq;
+    tx_ping[2]  = mac_seq++;
+    tx_ping[11] = app_seq++;
 
-    /* Tell DW3000 how many bytes in TX buffer */
-    dwt_writetxfctrl(sizeof(tx_ping_msg), 0, 0);
+    p_hexN("PING: tx", tx_ping, sizeof(tx_ping), 32);
 
-    /* Write frame to TX buffer */
-    dwt_writetxdata(sizeof(tx_ping_msg), tx_ping_msg, 0);
+    dwt_forcetrxoff();
+    HAL_Delay(2);
+    dwt_writesysstatuslo(0xFFFFFFFF);
 
-    /* Start transmission and wait for it to complete */
-    ret = dwt_starttx(DWT_START_TX_IMMEDIATE);
-    if (ret != DWT_SUCCESS)
-    {
-        snprintf(buf, sizeof(buf), "twr_ping: dwt_starttx ret=%ld\r\n", (long)ret);
-        dbg(buf);
+    dwt_writetxdata(sizeof(tx_ping), tx_ping, 0);
+    dwt_writetxfctrl((uint16_t)(sizeof(tx_ping) + FCS_LEN), 0, 0);
+
+    if (dwt_starttx(DWT_START_TX_IMMEDIATE) != DWT_SUCCESS) {
+        p("PING: TX FAIL\r\n");
         return;
     }
 
-    dbg("twr_ping: TX started\r\n");
-
-    /* Block until TX done (TXFRS) */
-    do
-    {
-        status = dwt_readsysstatuslo();
-    } while ((status & DWT_INT_TXFRS_BIT_MASK) == 0U);
-
-    dbg("twr_ping: TXFRS (TX done)\r\n");
-
-    /* Clear TXFRS bit */
+    uint32_t t0 = HAL_GetTick();
+    while (!(dwt_readsysstatuslo() & DWT_INT_TXFRS_BIT_MASK)) {
+        if (HAL_GetTick() - t0 > 50) {
+            p("PING: TX TIMEOUT\r\n");
+            dwt_forcetrxoff();
+            return;
+        }
+    }
     dwt_writesysstatuslo(DWT_INT_TXFRS_BIT_MASK);
 
-    /* Enable RX immediately to wait for PONG */
+    uint64_t T1 = read_tx_ts40();
+
+    {
+        char b[64];
+        snprintf(b, sizeof(b), "ping app_seq=%u\r\n", (unsigned)tx_ping[11]);
+        p(b);
+    }
+
+    dwt_writesysstatuslo(0xFFFFFFFF);
     dwt_rxenable(DWT_START_RX_IMMEDIATE);
-    dbg("twr_ping: RX enabled (waiting for PONG)\r\n");
 
-    /* Poll for RX events (RX good / RX error / timeout) */
-    uint32_t t0 = HAL_GetTick();
-    const uint32_t timeout_ms = 50;
+    t0 = HAL_GetTick();
+    while (HAL_GetTick() - t0 < 800) {
 
-    while (1)
-    {
-        status = dwt_readsysstatuslo();
+        uint32_t status = dwt_readsysstatuslo();
 
-        /* No event yet? Check SW timeout */
-        if ((status & (DWT_INT_RXFCG_BIT_MASK |
-                       DWT_INT_RXFTO_BIT_MASK |
-                       DWT_INT_RXPHE_BIT_MASK |
-                       DWT_INT_RXFCE_BIT_MASK |
-                       DWT_INT_RXFSL_BIT_MASK |
-                       DWT_INT_RXPTO_BIT_MASK |
-                       DWT_INT_RXOVRR_BIT_MASK |
-                       DWT_INT_RXSTO_BIT_MASK)) == 0U)
-        {
-            uint32_t t_now = HAL_GetTick();
-            if ((t_now - t0) > timeout_ms)
-            {
-                dbg("twr_ping: no event before SW timeout in RX phase\r\n");
-                //dwt_rxreset();
-                ping_seq++;
-                return;
+        if (status & DWT_INT_RXFCG_BIT_MASK) {
+
+            uint8_t rx[256];
+            uint16_t len = dwt_getframelength(NULL);
+            if (len > sizeof(rx)) len = sizeof(rx);
+
+            dwt_readrxdata(rx, len, 0);
+            dwt_writesysstatuslo(DWT_INT_RXFCG_BIT_MASK);
+
+            uint64_t T4 = read_rx_ts40();
+
+            p_hexN("PING: got", rx, len, 24);
+
+            int idx = -1;
+            if (find_pong(rx, len, tx_ping[11], &idx)) {
+
+                uint64_t T2 = read_ts40_from_msg(rx, idx + 3);
+                uint64_t T3 = read_ts40_from_msg(rx, idx + 8);
+
+                int64_t Ra = (int64_t)(T4 - T1);
+                int64_t Rb = (int64_t)(T3 - T2);
+                int64_t tof_dtu = (Ra - Rb) / 2;
+
+                uint32_t raw_mm = tof_ticks_to_mm(tof_dtu);
+
+                uint32_t corr_mm = 0;
+                if (raw_mm > OFFSET_MM) corr_mm = raw_mm - OFFSET_MM;
+
+                // jump reject
+                uint32_t used_mm = corr_mm;
+                uint8_t rejected = 0;
+
+                if (have_last) {
+                    uint32_t diff = (corr_mm > last_corr_mm) ? (corr_mm - last_corr_mm) : (last_corr_mm - corr_mm);
+                    if (diff > JUMP_REJECT_MM) {
+                        used_mm = last_corr_mm;  // hold last
+                        rejected = 1;
+                    } else {
+                        last_corr_mm = corr_mm;
+                    }
+                } else {
+                    last_corr_mm = corr_mm;
+                    have_last = 1;
+                }
+
+                char sToF[40];
+                i64_to_dec(sToF, sizeof(sToF), tof_dtu);
+
+                char raw_str[120], cor_str[120], use_str[120];
+                format_dist(raw_str, sizeof(raw_str), raw_mm);
+                format_dist(cor_str, sizeof(cor_str), corr_mm);
+                format_dist(use_str, sizeof(use_str), used_mm);
+
+                char out[420];
+                snprintf(out, sizeof(out),
+                         "OK seq=%u tof_dtu=%s\r\n"
+                         "  RAW : %s\r\n"
+                         "  CORR: %s\r\n"
+                         "  USED: %s%s\r\n",
+                         (unsigned)tx_ping[11], sToF,
+                         raw_str, cor_str, use_str,
+                         rejected ? "  (REJECTED jump)" : "");
+                p(out);
+
+            } else {
+                p("PING: not my pong\r\n");
             }
-            continue;
+
+            dwt_forcetrxoff();
+            return;
         }
 
-        /* We saw some RX event bits; break out and handle */
-        break;
+        if (status & (DWT_INT_RXFTO_BIT_MASK |
+                      DWT_INT_RXPTO_BIT_MASK |
+                      DWT_INT_RXFSL_BIT_MASK |
+                      DWT_INT_RXFCE_BIT_MASK))
+        {
+            dwt_writesysstatuslo(DWT_INT_RXFTO_BIT_MASK |
+                                 DWT_INT_RXPTO_BIT_MASK |
+                                 DWT_INT_RXFSL_BIT_MASK |
+                                 DWT_INT_RXFCE_BIT_MASK);
+            p("PING: RX err/timeout flag\r\n");
+            dwt_forcetrxoff();
+            return;
+        }
     }
 
-    snprintf(buf, sizeof(buf), "twr_ping: status(RX)=0x%08lX\r\n", (unsigned long)status);
-    dbg(buf);
-
-    /* Handle RX errors / timeouts first */
-    if (status & (DWT_INT_RXFTO_BIT_MASK  |
-                  DWT_INT_RXPHE_BIT_MASK  |
-                  DWT_INT_RXFCE_BIT_MASK  |
-                  DWT_INT_RXFSL_BIT_MASK  |
-                  DWT_INT_RXPTO_BIT_MASK  |
-                  DWT_INT_RXOVRR_BIT_MASK |
-                  DWT_INT_RXSTO_BIT_MASK))
-    {
-        dbg("twr_ping: no response (RX timeout or error)\r\n");
-
-        /* Clear all RX-related status bits and exit */
-        dwt_writesysstatuslo(DWT_INT_RXFTO_BIT_MASK  |
-                             DWT_INT_RXPHE_BIT_MASK  |
-                             DWT_INT_RXFCE_BIT_MASK  |
-                             DWT_INT_RXFSL_BIT_MASK  |
-                             DWT_INT_RXPTO_BIT_MASK  |
-                             DWT_INT_RXOVRR_BIT_MASK |
-                             DWT_INT_RXSTO_BIT_MASK);
-        ping_seq++;
-        return;
-    }
-
-    /* If we get here, we must have RXFCG set -> good frame */
-    if (status & DWT_INT_RXFCG_BIT_MASK)
-    {
-        dbg("twr_ping: RX OK (got PONG)\r\n");
-
-        /* Clear RXFCG bit */
-        uint16_t len = dwt_getframelength(NULL);
-        if (len > sizeof(rx_buf)) len = sizeof(rx_buf);
-
-        memset(rx_buf, 0, sizeof(rx_buf));
-        dwt_readrxdata(rx_buf, len, 0);
-
-
-        snprintf(buf, sizeof(buf),
-                 "twr_ping: RX data: %02X %02X %02X %02X\r\n",
-                 rx_buf[0], rx_buf[1], rx_buf[2], rx_buf[3]);
-        dbg(buf);
-
-        /* ---- NEW: 32-bit TX/RX timestamp logging ---- */
-        {
-            uint32_t t_tx32 = dwt_readtxtimestamplo32();
-            uint32_t t_rx32 = dwt_readrxtimestamplo32(DWT_COMPAT_NONE);
-            uint32_t dt32   = t_rx32 - t_tx32;    // wraps mod 2^32
-
-            /* ---- convert DTU → seconds → meters (integer-friendly) ---- */
-            double dtu = 15.65e-12;                 // device time unit (15 ps)
-            double c   = 299792458.0;            // speed of light (m/s)
-
-            double rtt_s = (double)dt32 * dtu;
-            double one_s = rtt_s * 0.5;
-            double dist_m = one_s * c;
-
-            /* convert to integers for printing (no %f required) */
-            uint32_t rtt_us = (uint32_t)(rtt_s * 1e6 + 0.5);          // round to nearest microsecond
-            uint32_t one_us = (uint32_t)(one_s * 1e6 + 0.5);
-            uint32_t dist_mm = (uint32_t)(dist_m);     // mm resolution
-            uint32_t dist_cm = dist_mm * 100;
-
-            snprintf(buf, sizeof(buf),
-                "twr_ping: dt=%lu ticks -> rtt=%lu us, one-way=%lu us, dist=%lu m (%lu cm)\r\n",
-                (unsigned long)dt32,
-                (unsigned long)rtt_us,
-                (unsigned long)one_us,
-                (unsigned long)dist_mm,
-                (unsigned long)dist_cm);
-            dbg(buf);
-
-
-
-        }
-        /* ------------------------------------------- */
-
-        /* Very basic sanity: expect 'P','O',same seq,0x0C */
-        /* Basic sanity: just check 'P','O' and matching seq */
-/*
-        if (rx_buf[0] == 'P' &&
-            rx_buf[1] == 'O' &&
-            rx_buf[2] == ping_seq)
-        {
-            dbg("twr_ping: valid PONG frame\r\n");
-        }
-        else
-        {
-            dbg("twr_ping: PONG frame format mismatch\r\n");
-        }
-
-*/
-        ping_seq++;
-        return;
-    }
-
-    /* Should not reach here, but just in case */
-    dbg("twr_ping: unexpected status combination\r\n");
-    ping_seq++;
+    p("PING: RX wait timeout\r\n");
+    dwt_forcetrxoff();
 }
