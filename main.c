@@ -6,7 +6,7 @@
   ******************************************************************************
   * @attention
   *
-  * Copyright (c) 2025 STMicroelectronics.
+  * Copyright (c) 2026 STMicroelectronics.
   * All rights reserved.
   *
   * This software is licensed under terms that can be found in the LICENSE file
@@ -21,9 +21,14 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include "twr_pong.h"
-#include <string.h>
-#include <stdio.h>
+#include "uart.h"
+#include "dwm_port.h"
+#include "deca_device_api.h"
+#include "dwm_init.h"
+#include "uwb_initiator.h"
+#include "uwb_ids.h"
+#include "dwm_radio.h"
+#include "uwb_twr.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -56,12 +61,20 @@ static void MX_GPIO_Init(void);
 static void MX_SPI1_Init(void);
 static void MX_USART2_UART_Init(void);
 /* USER CODE BEGIN PFP */
-static void uart2_print(const char *s) { HAL_UART_Transmit(&huart2, (uint8_t*)s, strlen(s), HAL_MAX_DELAY); }
+
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-
+static void force_spi_slow(void)
+{
+    HAL_SPI_DeInit(&hspi1);
+    hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_64;
+    hspi1.Init.NSSPMode = SPI_NSS_PULSE_DISABLE;
+    if (HAL_SPI_Init(&hspi1) != HAL_OK)
+        Error_Handler();
+}
+extern void dwt_configureframefilter(uint16_t enabletype, uint16_t filtermode);
 /* USER CODE END 0 */
 
 /**
@@ -96,35 +109,37 @@ int main(void)
   MX_SPI1_Init();
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
+  force_spi_slow();
 
-  uart2_print("\nThis is the first line \n");
-  char buf[64];
-  // startup banner
-  snprintf(buf, sizeof(buf), "\r\nG431_DWM_Responder starting...\r\n");
-  HAL_UART_Transmit(&huart2, (uint8_t*)buf, strlen(buf), HAL_MAX_DELAY);
+  dbg_init(&huart2);
+  dbg_print("\r\n--- BOOT (MAIN) ---\r\n");
 
-  // init DW3000
-  if (!dwm_init_minimal()) {
-      snprintf(buf, sizeof(buf), "DWM init FAILED\r\n");
-      HAL_UART_Transmit(&huart2, (uint8_t*)buf, strlen(buf), HAL_MAX_DELAY);
-      Error_Handler();
-  }
-// read and print device ID
-  uint32_t devid = dwm_read_devid();
-  snprintf(buf, sizeof(buf), "DW3000 devID = 0x%08lX\r\n", (unsigned long)devid);
-  HAL_UART_Transmit(&huart2, (uint8_t*)buf, strlen(buf), HAL_MAX_DELAY);
-  twr_pong_init();
+  uint32_t id = 0;
+  int pr = dw3000_init(&id);
+  dbg_printf("init ret=%d id=0x%08lX\r\n", pr, (unsigned long)id);
+
+  int rc = dwm_radio_apply_default();
+  dbg_printf("radio ret=%d\r\n", rc);
+  if (rc != 0) { dbg_print("RADIO CONFIG FAILED\r\n"); while (1) {} }
+
+  /* KEY: Disable frame filtering so short custom frames aren't dropped */
+  dwt_configureframefilter(0, 0);
+  dbg_print("FF: disabled via dwt_configureframefilter(0,0)\r\n");
+
+  //uwb_initiator_init();
+  uwb_twr_initi(8);
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	  //dbg("before step\r\n");
-	  twr_pong_step();
-	  HAL_Delay(5);
-	  //dbg("after step\r\n");
-	  //HAL_Delay(500);
+	  float m = 0;
+	  int r = uwb_twr_range_to(1, &m);
+	  dbg_printf("RANGE r=%d raw=0x%08lX\r\n", r, (unsigned long)(*(uint32_t*)&m));
+
+	  int32_t mm = (int32_t)(m * 1000.0f);
+	  dbg_printf("RANGE mm=%ld\r\n", (long)mm);
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -201,7 +216,7 @@ static void MX_SPI1_Init(void)
   hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
   hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
   hspi1.Init.NSS = SPI_NSS_SOFT;
-  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_4;
+  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_32;
   hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
   hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
   hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
@@ -285,10 +300,10 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(DWM_WAKEUP_GPIO_Port, DWM_WAKEUP_Pin, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(GPIOA, DWM_EXTON_Pin|DWM_RST_Pin, GPIO_PIN_SET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(DWM_RST_GPIO_Port, DWM_RST_Pin, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(DWM_WAKEUP_GPIO_Port, DWM_WAKEUP_Pin, GPIO_PIN_SET);
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(DWM_CS_GPIO_Port, DWM_CS_Pin, GPIO_PIN_SET);
@@ -299,11 +314,12 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : DWM_EXTON_Pin */
-  GPIO_InitStruct.Pin = DWM_EXTON_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  /*Configure GPIO pins : DWM_EXTON_Pin DWM_RST_Pin */
+  GPIO_InitStruct.Pin = DWM_EXTON_Pin|DWM_RST_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(DWM_EXTON_GPIO_Port, &GPIO_InitStruct);
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
   /*Configure GPIO pin : DWM_WAKEUP_Pin */
   GPIO_InitStruct.Pin = DWM_WAKEUP_Pin;
@@ -311,13 +327,6 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(DWM_WAKEUP_GPIO_Port, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : DWM_RST_Pin */
-  GPIO_InitStruct.Pin = DWM_RST_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(DWM_RST_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pin : DWM_IRQ_Pin */
   GPIO_InitStruct.Pin = DWM_IRQ_Pin;

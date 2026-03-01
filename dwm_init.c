@@ -1,142 +1,62 @@
 #include "dwm_init.h"
 #include "dwm_port.h"
-
-#include "main.h"
-#include "stm32g4xx_hal.h"
-
 #include "deca_device_api.h"
-#include "deca_interface.h"
-
+#include "uart.h"
+#include "dwm_diag.h"
+#include "dwm_spi_if.h"
 #include <string.h>
-#include <stdio.h>
 
-extern UART_HandleTypeDef huart2;
-
-/* Required by your EXTI callback (and other files) */
-volatile int g_dwt_ready = 0;
-
-/* Provided by Qorvo/driver glue */
-extern struct dwt_spi_s *get_dwt_spi_ops(void);
+/* Driver descriptor (exists when USE_DRV_DW3000 is defined) */
 extern const struct dwt_driver_s dw3000_driver;
-extern void dwm_wakeup_io(void);
 
-static struct dwt_probe_s g_probe;
-
-static void p(const char *s)
+int dw3000_init(uint32_t *out_devid)
 {
-    HAL_UART_Transmit(&huart2, (uint8_t *)s, (uint16_t)strlen(s), HAL_MAX_DELAY);
-}
+    dbg_print("dwm_init: port_init...\r\n");
+    dw3000_port_init();
+    dbg_print("dwm_init: port_init OK\r\n");
 
-bool dwm_init_minimal(void)
-{
-    char buf[96];
+    dbg_print("dwm_init: hard_reset...\r\n");
+    dw3000_hard_reset();
+    dbg_print("dwm_init: hard_reset OK\r\n");
 
-    p("INIT start\r\n");
+    dbg_print("dwm_init: wakeup_pulse...\r\n");
+    dw3000_wakeup_pulse();
+    dbg_print("dwm_init: wakeup_pulse OK\r\n");
 
-    dwm_port_init();
-    p("INIT: port ok\r\n");
+    /* RAW SPI sanity check (no driver) */
+    dbg_print("dwm_init: raw read DEV_ID...\r\n");
+    uint32_t raw_id = 0;
+    int rr = dwm_raw_read_devid(&raw_id);
+    dbg_printf("dwm_init: raw read ret=%d raw_id=0x%08lX\r\n", rr, (unsigned long)raw_id);
 
-    p("RESET: start\r\n");
-    dwm_reset_device();
-    p("RESET: done\r\n");
-
-    /* ---------- SLOW SPI for probe/early init ---------- */
-    dwm_set_spi_slow();
-    p("INIT: spi slow\r\n");
-
-    /* ---------- PROBE ---------- */
-    g_probe.dw  = NULL;
-    g_probe.spi = (void*)get_dwt_spi_ops();
-    g_probe.wakeup_device_with_io = dwm_wakeup_io;
-
-    static struct dwt_driver_s * const drivers[] = {
-        (struct dwt_driver_s *)&dw3000_driver
-    };
-    g_probe.driver_list    = (struct dwt_driver_s **)drivers;
-    g_probe.dw_driver_num  = 1;
-
-    p("INIT: probing...\r\n");
-    int ret = dwt_probe(&g_probe);
-    snprintf(buf, sizeof(buf), "INIT: dwt_probe ret=%d\r\n", ret);
-    p(buf);
-    if (ret != DWT_SUCCESS) {
-        p("INIT FAIL: probe\r\n");
-        return false;
+    if (raw_id == 0x00000000UL || raw_id == 0xFFFFFFFFUL)
+    {
+        dbg_print("dwm_init: RAW_ID invalid -> check SPI/CS/power/reset\r\n");
+        if (out_devid) *out_devid = raw_id;
+        return -999;
     }
 
-    /* ---------- IDLERC ---------- */
-    p("INIT: idlerc...\r\n");
-    int32_t rc = dwt_checkidlerc();
-    snprintf(buf, sizeof(buf), "INIT: idlerc rc=%ld\r\n", (long)rc);
-    p(buf);
-    if (rc == 0) {
-        p("INIT FAIL: idlerc\r\n");
-        return false;
-    }
+    /* Build the probe interface struct expected by this API version */
+    static struct dwt_driver_s *driver_list[1];
+    driver_list[0] = (struct dwt_driver_s *)&dw3000_driver;
 
-    /* ---------- INITIALISE ---------- */
-    p("INIT: initialise...\r\n");
-    if (dwt_initialise(DWT_DW_INIT) != DWT_SUCCESS) {
-        p("INIT FAIL: initialise\r\n");
-        return false;
-    }
-    p("INIT: initialise OK\r\n");
+    struct dwt_probe_s probe;
+    memset(&probe, 0, sizeof(probe));
 
-    /*
-     * If you previously saw dwt_configure() hang, doing a softreset here
-     * can help recover the state machine.
-     */
-    p("INIT: softreset before config\r\n");
-    dwt_softreset(1);
-    HAL_Delay(2);
-    dwt_forcetrxoff();
-    HAL_Delay(2);
+    probe.dw = NULL;
+    probe.spi = dwm_get_spi_if();               /* <-- KEY CHANGE */
+    probe.wakeup_device_with_io = dw3000_wakeup_pulse;
+    probe.driver_list = driver_list;
+    probe.dw_driver_num = 1;
 
-    /* ---------- CONFIG (keep SLOW SPI during configure) ---------- */
-    p("INIT: configuring radio...\r\n");
+    dbg_print("dwm_init: calling dwt_probe...\r\n");
+    int32_t pr = dwt_probe(&probe);
+    dbg_printf("dwm_init: dwt_probe ret=%ld\r\n", (long)pr);
 
-    dwt_config_t cfg = {0};
+    dbg_print("dwm_init: dwt_readdevid...\r\n");
+    uint32_t id = dwt_readdevid();
+    dbg_printf("dwm_init: devID=0x%08lX\r\n", (unsigned long)id);
 
-    /* Use Channel 5 as you mentioned you set it back */
-    cfg.chan            = 5;
-
-    /* These are “safe defaults” to get packets moving */
-    cfg.txPreambLength  = DWT_PLEN_128;
-    cfg.rxPAC           = DWT_PAC8;
-    cfg.txCode          = 9;
-    cfg.rxCode          = 9;
-    cfg.sfdType         = 0;                 /* standard 8-bit IEEE SFD */
-    cfg.dataRate        = DWT_BR_6M8;
-    cfg.phrMode         = DWT_PHRMODE_STD;
-    cfg.phrRate         = DWT_PHRRATE_STD;
-    cfg.sfdTO           = (128 + 64 - 8);    /* common rule-of-thumb */
-    cfg.stsMode         = DWT_STS_MODE_OFF;
-    cfg.stsLength       = DWT_STS_LEN_64;    /* ignored when STS off */
-    cfg.pdoaMode        = DWT_PDOA_M0;
-
-    if (dwt_configure(&cfg) != DWT_SUCCESS) {
-        p("INIT FAIL: config\r\n");
-        return false;
-    }
-
-    p("INIT: config OK\r\n");
-
-    /* ---------- NOW FAST SPI ---------- */
-    dwm_set_spi_fast();
-    p("INIT: spi fast\r\n");
-
-    /* You will later replace these with calibrated values */
-    dwt_settxantennadelay(16384);
-    dwt_setrxantennadelay(16384);
-
-    dwt_forcetrxoff();
-
-    p("INIT SUCCESS\r\n");
-    g_dwt_ready = 1;
-    return true;
-}
-
-uint32_t dwm_read_devid(void)
-{
-    return dwt_readdevid();
+    if (out_devid) *out_devid = id;
+    return (int)pr;
 }
