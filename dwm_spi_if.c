@@ -1,15 +1,25 @@
 #include "dwm_spi_if.h"
-#include "deca_interface.h"   /* struct dwt_spi_s */
+#include "deca_interface.h"
 #include "deca_spi.h"
+#include "stm32g4xx_hal.h"
+#include "main.h"
 
-/* Wrappers to match the signatures expected by this driver build */
+/* Pull in the SPI handle from CubeMX */
+extern SPI_HandleTypeDef hspi1;
+
+static void spi_apply_prescaler(uint32_t presc)
+{
+    HAL_SPI_DeInit(&hspi1);
+    hspi1.Init.BaudRatePrescaler = presc;
+    hspi1.Init.NSSPMode = SPI_NSS_PULSE_DISABLE;
+    (void)HAL_SPI_Init(&hspi1);
+}
 
 static int32_t dwm_readfromspi_wrap(uint16_t headerLength,
                                    uint8_t *headerBuffer,
                                    uint16_t readLength,
                                    uint8_t *readBuffer)
 {
-    /* Cast headerBuffer to const because your deca_spi takes const */
     return (int32_t)readfromspi(headerLength,
                                (const uint8_t*)headerBuffer,
                                (uint32_t)readLength,
@@ -27,11 +37,10 @@ static int32_t dwm_writetospi_wrap(uint16_t headerLength,
                               bodyBuffer);
 }
 
-/* Optional SPI rate hooks. Keep as no-ops for now. */
-static void spi_set_slow(void) { }
-static void spi_set_fast(void) { }
+/* Driver calls these around init / after init */
+static void spi_set_slow(void) { spi_apply_prescaler(SPI_BAUDRATEPRESCALER_64); }
+static void spi_set_fast(void) { spi_apply_prescaler(SPI_BAUDRATEPRESCALER_4);  }
 
-/* Must match your deca_interface.h field names (these appear to be correct for your build) */
 static struct dwt_spi_s g_spi_if =
 {
     .readfromspi = dwm_readfromspi_wrap,
